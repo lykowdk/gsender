@@ -412,9 +412,17 @@ class Visualizer extends Component {
             this.visualizer.setFrameIndex(frameIndex);
             // grey lines
             if (this.props.senderStatus) {
-                this.visualizer.greyOutLines(
-                    this.props.senderStatus.currentLineRunning,
-                );
+                const activeLine =
+                    this.props.senderStatus.currentLineRunning;
+                this.visualizer.greyOutLines(activeLine);
+                // Tell the heat-map legend where the active move sits on the
+                // gradient so it can render a pointer at the right position.
+                if (this.visualizer.heatmapEnabled) {
+                    const r = this.visualizer.getActiveRatioForLine(activeLine);
+                    pubsub.publish('visualizer:heatmap:activeRatio', {
+                        ratio: r >= 0 ? r : null,
+                    });
+                }
             }
         }
 
@@ -1076,6 +1084,17 @@ class Visualizer extends Component {
                 if (this.visualizer) {
                     this.visualizer.setHideProcessedLines(false);
                     this.updateScene({ forceUpdate: true });
+                }
+                pubsub.publish('visualizer:heatmap:activeRatio', { ratio: null });
+            }),
+            pubsub.subscribe('visualizer:heatmap', (msg, override) => {
+                // The settings UI only writes to the persisted store on
+                // "Apply"; the pubsub payload carries the new value so the
+                // live preview switches immediately on toggle.
+                this.applyHeatmapSettings(override || {});
+                this.updateScene({ forceUpdate: true });
+                if (override && override.enabled === false) {
+                    pubsub.publish('visualizer:heatmap:activeRatio', { ratio: null });
                 }
             }),
             pubsub.subscribe('workflow:state', (msg, state) => {
@@ -2663,6 +2682,10 @@ class Visualizer extends Component {
         obj.name = 'toolpath';
         this.group.add(obj);
 
+        // Apply feedrate heat map if the user has it enabled. Must come after
+        // render() so the geometry exists; setHeatmapMode is a no-op otherwise.
+        this.applyHeatmapSettings();
+
         const bbox = getBoundingBox(obj);
         const dX = bbox.max.x - bbox.min.x;
         const dY = bbox.max.y - bbox.min.y;
@@ -2785,6 +2808,38 @@ class Visualizer extends Component {
         return this.visualizer.getHull();
     }
 
+    // Apply the heat-map setting to the rendered geometry. `override.enabled`
+    // skips the store read so the live preview switches on toggle without
+    // waiting for the Settings page's deferred persist.
+    applyHeatmapSettings(override = {}) {
+        const enabled =
+            typeof override.enabled === 'boolean'
+                ? override.enabled
+                : store.get('widgets.visualizer.feedrateHeatmap', false);
+
+        const hasGeometry = Boolean(
+            this.visualizer?.vertexRatios?.length,
+        );
+
+        // Defensive: if the active parse has no ratio data but a file is
+        // loaded, auto-reparse once. Covers stale in-memory parses from
+        // dev hot-reloads and any future worker change that fails to emit
+        // ratios. handleSceneRender will call us again on completion.
+        const fileContent = _get(this.props, 'state.gcode.content', '');
+        if (enabled && this.visualizer && !hasGeometry && fileContent
+            && !this._heatmapReparseRequested) {
+            this._heatmapReparseRequested = true;
+            this.reparseGCode();
+            return;
+        }
+        if (hasGeometry) {
+            this._heatmapReparseRequested = false;
+        }
+
+        this.visualizer?.setHeatmapMode(enabled);
+        pubsub.publish('visualizer:heatmap:applied', { enabled, hasGeometry });
+    }
+
     load(name, vizualization, callback) {
         // When in SVG lite mode, the 3D Visualizer is hidden with a cleared scene.
         // Returning early here prevents creating a GCodeVisualizer and calling
@@ -2837,6 +2892,10 @@ class Visualizer extends Component {
             vizualization.savedColorsBuffer,
             vizualization.savedColorLen,
         );
+        const vertexRatios = toBoundedFloat32Array(
+            vizualization.vertexRatiosBuffer,
+            vizualization.vertexRatioLen,
+        );
 
         const visualization = {
             ...vizualization,
@@ -2848,6 +2907,7 @@ class Visualizer extends Component {
                 vizualization.frames,
                 vizualization.framesLen,
             ),
+            vertexRatios,
         };
 
         const hideProcessedLines = store.get(

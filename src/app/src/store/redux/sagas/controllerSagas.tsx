@@ -255,6 +255,16 @@ export function* initialize(): Generator<any, void, any> {
                 _get(reduxState, 'controller.settings.settings.$113', 3000.0),
             ),
         };
+        // GRBL $11 (mm). Used by the heat map planner to compute junction
+        // velocities; falls back to GRBL's default when no controller is
+        // connected or the setting isn't reported.
+        const junctionDeviation = Number(
+            _get(reduxState, 'controller.settings.settings.$11', 0.01),
+        );
+        // Firmware type — used by the heat map planner to pick the matching
+        // junction formula (vanilla GRBL uses the new block's accel, grblHAL
+        // uses the average of the two block accels at the junction).
+        const firmwareType = _get(reduxState, 'controller.type', '');
         const rotaryDiameterOffsetEnabled = store.get(
             'widgets.visualizer.rotaryDiameterOffsetEnabled',
             false,
@@ -320,6 +330,8 @@ export function* initialize(): Generator<any, void, any> {
                     isLaser,
                     accelerations,
                     maxFeedrates,
+                    junctionDeviation,
+                    firmwareType,
                     atcEnabled,
                     rotaryDiameterOffsetEnabled,
                     theme: getVisualizerTheme(),
@@ -382,6 +394,8 @@ export function* initialize(): Generator<any, void, any> {
             isNewFile,
             accelerations,
             maxFeedrates,
+            junctionDeviation,
+            firmwareType,
             atcEnabled,
             rotaryDiameterOffsetEnabled,
             theme: getVisualizerTheme(),

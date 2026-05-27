@@ -54,6 +54,8 @@ interface WorkerData {
     needsVisualization?: boolean;
     accelerations?: any;
     maxFeedrates?: any;
+    junctionDeviation?: number;
+    firmwareType?: string;
     atcEnabled?: boolean;
     rotaryDiameterOffsetEnabled?: boolean;
     isSecondary: boolean;
@@ -350,6 +352,8 @@ self.onmessage = function ({ data }: { data: WorkerData }) {
         // isNewFile = false,
         accelerations,
         maxFeedrates,
+        junctionDeviation: junctionDeviationInput,
+        firmwareType,
         atcEnabled,
         rotaryDiameterOffsetEnabled = true,
         isSecondary,
@@ -434,6 +438,163 @@ self.onmessage = function ({ data }: { data: WorkerData }) {
     };
     let maxSpindleSpeed = 0;
     let spindleSpeed = 0;
+
+    // Feedrate heat map state. After the planner runs we emit one ratio per
+    // vertex (not per frame): the speed actually reached at that point in the
+    // move divided by the commanded F. -1 means "skip in heat map" (G0 rapid,
+    // M-only line, or a line with no F set). Per-vertex granularity lets
+    // THREE.Line interpolate colors smoothly along each move — a stroke that
+    // accelerates from a slow corner up to F and back down to another corner
+    // visibly fades red → green → red instead of being one flat color.
+    interface PlannerBlock {
+        L: number;            // mm (file units already converted)
+        ux: number;           // chord unit vector
+        uy: number;
+        uz: number;
+        accel: number;        // mm/s², axis-limited
+        vnominal: number;     // mm/s
+        commandedFmm: number; // mm/min, ratio denominator
+        unitScale: number;    // file-units → mm (1 or 25.4)
+        isCutting: boolean;   // G1/G2/G3
+        hasMotion: boolean;
+        vertexStart: number;  // first vertex index belonging to this block
+        vertexEnd: number;    // one past last vertex index
+    }
+    const plannerBlocks: PlannerBlock[] = [];
+
+    // Per-frame geometry accumulator filled by addLine/addArcCurve, drained in
+    // the 'data' handler.
+    let blockHasGeom = false;
+    let blockStartX = 0, blockStartY = 0, blockStartZ = 0;
+    let blockEndX = 0, blockEndY = 0, blockEndZ = 0;
+    let blockL = 0;
+    const accumulateSegment = (
+        x1: number, y1: number, z1: number,
+        x2: number, y2: number, z2: number,
+    ): void => {
+        if (!blockHasGeom) {
+            blockStartX = x1; blockStartY = y1; blockStartZ = z1;
+            blockHasGeom = true;
+        }
+        blockEndX = x2; blockEndY = y2; blockEndZ = z2;
+        const dx = x2 - x1, dy = y2 - y1, dz = z2 - z1;
+        blockL += Math.sqrt(dx * dx + dy * dy + dz * dz);
+    };
+
+    // Planner constants. Defaults match the controllerSagas fallbacks so the
+    // heat map is meaningful even when no controller is connected.
+    // Accelerations are mm/s², max feeds are mm/min, $11 is in mm.
+    const xAccel = Number((accelerations as any)?.xAccel) || 750;
+    const yAccel = Number((accelerations as any)?.yAccel) || 750;
+    const zAccel = Number((accelerations as any)?.zAccel) || 750;
+    const xMaxFeed = Number((maxFeedrates as any)?.xMaxFeed) || 4000;
+    const yMaxFeed = Number((maxFeedrates as any)?.yMaxFeed) || 4000;
+    const zMaxFeed = Number((maxFeedrates as any)?.zMaxFeed) || 3000;
+    // $11 from the controller settings when connected, else GRBL's default.
+    const JUNCTION_DEVIATION = Number(junctionDeviationInput) > 0
+        ? Number(junctionDeviationInput)
+        : 0.01;
+
+    // Vanilla GRBL's junction formula uses the new block's acceleration.
+    // grblHAL uses the average of the two adjoining blocks' accels. When
+    // firmware is unknown (no controller connected), fall back to the
+    // average — it's a slightly more conservative middle ground.
+    const isGrblHal =
+        typeof firmwareType === 'string' &&
+        firmwareType.toLowerCase().includes('hal');
+    const useNewBlockAccelForJunction = !isGrblHal && firmwareType === 'Grbl';
+    const junctionAccel = (prev: number, curr: number): number =>
+        useNewBlockAccelForJunction ? curr : 0.5 * (prev + curr);
+
+    // A-axis caps are reported in degrees/min and degrees/s² by the
+    // controller; convert to mm-equivalent using the rotary diameter so the
+    // 4D planner math is consistent (XYZ in mm, A in mm-equivalent).
+    const aMaxFeedDeg = Number((maxFeedrates as any)?.aMaxFeed) || 3000;
+    const aAccelDeg = Number((accelerations as any)?.aAccel) || 750;
+    const rotaryDiameterForA =
+        rotaryRadius && rotaryRadius > 0 ? rotaryRadius * 2 : 50;
+    const aMaxFeedLinear =
+        (aMaxFeedDeg * Math.PI * rotaryDiameterForA) / 360; // mm/min
+    const aAccelLinear =
+        (aAccelDeg * Math.PI * rotaryDiameterForA) / 360; // mm/s²
+
+    // Push one planner block (a straight chord, an arc chord, or a single
+    // helical move treated as 4D-linear). `ua` is the linear-equivalent A
+    // unit component for rotary moves (use 0 for pure 3-axis motion).
+    // lenMm is the move's true path length (4D Euclidean for helicals).
+    // commandedFmmPerMin is the modal F (in mm/min), already converted from
+    // file units and resolved against G93/G94.
+    const pushChordBlock = (
+        ux: number, uy: number, uz: number,
+        lenMm: number,
+        commandedFmmPerMin: number,
+        isCutting: boolean,
+        unitScale: number,
+        vertexStart: number,
+        vertexEnd: number,
+        ua: number = 0,
+    ): void => {
+        const ax = Math.abs(ux), ay = Math.abs(uy), az = Math.abs(uz), aa = Math.abs(ua);
+        let aMove = Infinity, fMaxAxis = Infinity;
+        if (ax > 1e-9) {
+            aMove = Math.min(aMove, xAccel / ax);
+            fMaxAxis = Math.min(fMaxAxis, xMaxFeed / ax);
+        }
+        if (ay > 1e-9) {
+            aMove = Math.min(aMove, yAccel / ay);
+            fMaxAxis = Math.min(fMaxAxis, yMaxFeed / ay);
+        }
+        if (az > 1e-9) {
+            aMove = Math.min(aMove, zAccel / az);
+            fMaxAxis = Math.min(fMaxAxis, zMaxFeed / az);
+        }
+        if (aa > 1e-9) {
+            aMove = Math.min(aMove, aAccelLinear / aa);
+            fMaxAxis = Math.min(fMaxAxis, aMaxFeedLinear / aa);
+        }
+        if (!isFinite(aMove)) aMove = 750;
+        if (!isFinite(fMaxAxis)) fMaxAxis = xMaxFeed;
+        const vnominalMmPerMin = isCutting && commandedFmmPerMin > 0
+            ? Math.min(commandedFmmPerMin, fMaxAxis)
+            : fMaxAxis;
+        plannerBlocks.push({
+            L: lenMm,
+            ux, uy, uz,
+            accel: aMove,
+            vnominal: vnominalMmPerMin / 60,
+            commandedFmm: commandedFmmPerMin,
+            unitScale,
+            isCutting,
+            hasMotion: true,
+            vertexStart,
+            vertexEnd,
+        });
+    };
+
+    // Set by the arc and helical handlers when they push planner blocks
+    // directly (per-chord for arcs, single 4D-aware for helicals). The 'data'
+    // handler then skips its catch-all per-line block push so the line isn't
+    // double-counted.
+    let lineEmittedOwnBlocks = false;
+
+    // Resolve commanded F (mm/min) honoring G93 inverse-time mode. In G93 a
+    // move's F means "complete this move in 1/F minutes", so commanded
+    // velocity is moveLength * F. In G94 (default) F is mm/min directly and
+    // just needs the file-units conversion. moveLenMm is only used for G93.
+    const resolveCommandedFmm = (
+        rawF: number,
+        unitScale: number,
+        moveLenMm: number,
+    ): number => {
+        if (!Number.isFinite(rawF) || rawF <= 0) {
+            return 0;
+        }
+        const isInverseTime = (vm as any).modal?.feedrate === 'G93';
+        if (isInverseTime) {
+            return moveLenMm > 0 ? moveLenMm * rawF : 0;
+        }
+        return rawF * unitScale;
+    };
 
     // SVG specific state variables
     let SVGVertices: SVGVertex[] = [];
@@ -586,6 +747,15 @@ self.onmessage = function ({ data }: { data: WorkerData }) {
                         );
                         const opacity = motion === 'G0' ? 0.5 : 1;
 
+                        // Capture pre-rotation deltas for the helical planner
+                        // block, pushed after the vertex loop. blockL (3D
+                        // helical path length) is read from accumulateSegment
+                        // after the loop runs.
+                        const helV1x = v1.x, helV1y = v1.y, helV1z = v1.z;
+                        const helV2x = v2.x, helV2y = v2.y, helV2z = v2.z;
+                        const helDA = (v2.a || 0) - (v1.a || 0); // degrees
+                        const helVStart = vertices.length / 3;
+
                         // Reusable scalars — no per-iteration object allocation
                         let prevX = 0, prevY = 0, prevZ = 0;
                         for (let i = 0; i <= segments; i++) {
@@ -620,6 +790,14 @@ self.onmessage = function ({ data }: { data: WorkerData }) {
                                     currY,
                                     currZ,
                                 );
+                                accumulateSegment(
+                                    prevX,
+                                    prevY,
+                                    prevZ,
+                                    currX,
+                                    currY,
+                                    currZ,
+                                );
 
                                 // SVG
                                 if (shouldIncludeSVG) {
@@ -638,6 +816,54 @@ self.onmessage = function ({ data }: { data: WorkerData }) {
                             prevX = currX;
                             prevY = currY;
                             prevZ = currZ;
+                        }
+
+                        // Push one planner block for the whole helical move.
+                        // We use the 3D chord direction (pre-rotation deltas)
+                        // for the unit vector, the accumulated helical path
+                        // length for L, and an A-axis component computed from
+                        // the linear-equivalent rotary delta. ua makes
+                        // pushChordBlock include aMaxFeed / aAccel in the
+                        // per-axis caps so machines with slow rotary axes
+                        // don't get unrealistically fast helical predictions.
+                        const helUnitScale = units === 'G21' ? 1 : 25.4;
+                        const helIsCutting =
+                            motion === 'G1' || motion === 'G2' || motion === 'G3';
+                        const helL3D = blockL * helUnitScale; // mm
+                        const helDX = (helV2x - helV1x) * helUnitScale;
+                        const helDY = (helV2y - helV1y) * helUnitScale;
+                        const helDZ = (helV2z - helV1z) * helUnitScale;
+                        const helLinChord = Math.sqrt(
+                            helDX * helDX + helDY * helDY + helDZ * helDZ,
+                        );
+                        const helDALinear =
+                            (Math.abs(helDA) * Math.PI * rotaryDiameterForA) /
+                            360;
+                        const hel4DLen = Math.sqrt(
+                            helLinChord * helLinChord +
+                                helDALinear * helDALinear,
+                        );
+                        const helUx = hel4DLen > 1e-9 ? helDX / hel4DLen : 0;
+                        const helUy = hel4DLen > 1e-9 ? helDY / hel4DLen : 0;
+                        const helUz = hel4DLen > 1e-9 ? helDZ / hel4DLen : 0;
+                        const helUa = hel4DLen > 1e-9 ? helDALinear / hel4DLen : 0;
+                        const helCmdMm = resolveCommandedFmm(
+                            Number((vm as any).feed) || 0,
+                            helUnitScale,
+                            helL3D,
+                        );
+                        if (blockL > 0) {
+                            pushChordBlock(
+                                helUx, helUy, helUz,
+                                helL3D,
+                                helCmdMm,
+                                helIsCutting,
+                                helUnitScale,
+                                helVStart,
+                                vertices.length / 3,
+                                helUa,
+                            );
+                            lineEmittedOwnBlocks = true;
                         }
                     } else {
                         // No A-axis rotation, use simple linear interpolation
@@ -661,22 +887,41 @@ self.onmessage = function ({ data }: { data: WorkerData }) {
                         v2.y = newV2.y;
                         v2.z = newV2.z;
 
-                        // normal
+                        // Subdivide long moves so THREE.Line has intermediate
+                        // vertices to sample the trapezoid velocity profile.
+                        // Without this a 100mm cut between two slow corners
+                        // gets only 2 vertices (red+red) and the cruise
+                        // plateau in the middle interpolates as red instead
+                        // of showing as green. ~10 file units per chunk keeps
+                        // resolution good without ballooning vertex count.
                         const opacity = motion === 'G0' ? 0.5 : 1;
-                        pushMotionColor(motion, opacity, 2);
-                        pushFloat32_6(
-                            vertices,
-                            v1.x,
-                            v1.y,
-                            v1.z,
-                            v2.x,
-                            v2.y,
-                            v2.z,
+                        const dxLine = v2.x - v1.x;
+                        const dyLine = v2.y - v1.y;
+                        const dzLine = v2.z - v1.z;
+                        const lineLen = Math.sqrt(
+                            dxLine * dxLine + dyLine * dyLine + dzLine * dzLine,
                         );
+                        const SUBDIV_MAX = 10; // file units (mm or inches)
+                        const nSubs =
+                            lineLen > SUBDIV_MAX
+                                ? Math.ceil(lineLen / SUBDIV_MAX)
+                                : 1;
+                        let pX = v1.x, pY = v1.y, pZ = v1.z;
+                        for (let s = 1; s <= nSubs; s++) {
+                            const t = s / nSubs;
+                            const cX = v1.x + dxLine * t;
+                            const cY = v1.y + dyLine * t;
+                            const cZ = v1.z + dzLine * t;
+                            pushMotionColor(motion, opacity, 2);
+                            pushFloat32_6(vertices, pX, pY, pZ, cX, cY, cZ);
+                            accumulateSegment(pX, pY, pZ, cX, cY, cZ);
+                            pX = cX; pY = cY; pZ = cZ;
+                        }
 
-                        // svg
+                        // svg (one path segment for the whole line — SVG
+                        // export doesn't benefit from subdivision)
                         if (shouldIncludeSVG) {
-                            const multiplier = units === 'G21' ? 1 : 25.4; // We need to make path bigger for inches
+                            const multiplier = units === 'G21' ? 1 : 25.4;
                             svgInitialization(motion);
                             SVGVertices.push({
                                 x1: v1.x * multiplier,
@@ -731,6 +976,14 @@ self.onmessage = function ({ data }: { data: WorkerData }) {
                             pushMotionColor(motion, 1, 2);
                             pushFloat32_6(
                                 vertices,
+                                prevX,
+                                prevY,
+                                prevZ,
+                                currX,
+                                currY,
+                                currZ,
+                            );
+                            accumulateSegment(
                                 prevX,
                                 prevY,
                                 prevZ,
@@ -831,15 +1084,31 @@ self.onmessage = function ({ data }: { data: WorkerData }) {
                         svgInitialization(motion);
                     }
 
+                    // Per-chord planner block params, captured once per arc:
+                    // the gcode F and the units are modal at parse time, and
+                    // every chord of the arc is the same cutting motion.
+                    // For G93 inverse-time the commanded velocity uses the
+                    // total arc length (each chord shares that velocity).
+                    const arcUnitScale = units === 'G21' ? 1 : 25.4;
+                    const arcIsCutting = motion === 'G2' || motion === 'G3';
+                    const arcCommandedFmm = resolveCommandedFmm(
+                        Number((vm as any).feed) || 0,
+                        arcUnitScale,
+                        arcLength * arcUnitScale,
+                    );
+                    let arcChordsPushed = 0;
+                    let prevAX = 0, prevAY = 0, prevAZ = 0;
                     for (let i = 0; i < points.length; ++i) {
                         const point = points[i];
                         const pointA = points[i - 1];
                         const pointB = points[i];
                         const z = ((v2.z - v1.z) / pointCount) * i + v1.z;
 
+                        let pushedX = 0, pushedY = 0, pushedZ = 0;
                         if (plane === 'G17') {
                             // XY-plane
                             pushFloat32_3(vertices, point.x, point.y, z);
+                            pushedX = point.x; pushedY = point.y; pushedZ = z;
                             if (shouldIncludeSVG && i > 0) {
                                 SVGVertices.push({
                                     x1: pointA.x * multiplier,
@@ -851,6 +1120,7 @@ self.onmessage = function ({ data }: { data: WorkerData }) {
                         } else if (plane === 'G18') {
                             // ZX-plane
                             pushFloat32_3(vertices, point.y, z, point.x);
+                            pushedX = point.y; pushedY = z; pushedZ = point.x;
                             if (shouldIncludeSVG && i > 0) {
                                 SVGVertices.push({
                                     x1: pointA.y * multiplier,
@@ -862,6 +1132,7 @@ self.onmessage = function ({ data }: { data: WorkerData }) {
                         } else if (plane === 'G19') {
                             // YZ-plane
                             pushFloat32_3(vertices, z, point.x, point.y);
+                            pushedX = z; pushedY = point.x; pushedZ = point.y;
                             if (shouldIncludeSVG && i > 0) {
                                 if (i > 0) {
                                     SVGVertices.push({
@@ -874,6 +1145,38 @@ self.onmessage = function ({ data }: { data: WorkerData }) {
                             }
                         }
                         pushMotionColor(motion, 1);
+
+                        if (i > 0) {
+                            // Each chord becomes its own planner block with
+                            // its real tangent direction, so junction velocity
+                            // along the arc and at arc endpoints models what
+                            // GRBL actually does (it segments arcs internally).
+                            const dx = pushedX - prevAX;
+                            const dy = pushedY - prevAY;
+                            const dz = pushedZ - prevAZ;
+                            const chordLenFile =
+                                Math.sqrt(dx * dx + dy * dy + dz * dz);
+                            if (chordLenFile > 1e-9) {
+                                const inv = 1 / chordLenFile;
+                                const vEnd = vertices.length / 3;
+                                pushChordBlock(
+                                    dx * inv, dy * inv, dz * inv,
+                                    chordLenFile * arcUnitScale,
+                                    arcCommandedFmm,
+                                    arcIsCutting,
+                                    arcUnitScale,
+                                    vEnd - 2,
+                                    vEnd,
+                                );
+                                arcChordsPushed++;
+                            }
+                        }
+                        prevAX = pushedX;
+                        prevAY = pushedY;
+                        prevAZ = pushedZ;
+                    }
+                    if (arcChordsPushed > 0) {
+                        lineEmittedOwnBlocks = true;
                     }
                 }
             },
@@ -1029,6 +1332,62 @@ self.onmessage = function ({ data }: { data: WorkerData }) {
             const spindleIsOn = vm.modal.spindle === 'M3' || vm.modal.spindle === 'M4';
             pushFloat32_1(spindleFrameSpeeds, spindleIsOn ? spindleSpeed : 0);
         }
+
+        if (needsVisualization) {
+            if (lineEmittedOwnBlocks) {
+                // The arc handler already emitted per-chord blocks for this
+                // gcode line; don't push a redundant whole-arc block.
+                lineEmittedOwnBlocks = false;
+            } else {
+                const vertexStart =
+                    plannerBlocks.length === 0
+                        ? 0
+                        : plannerBlocks[plannerBlocks.length - 1].vertexEnd;
+                const vertexEnd = vertices.length / 3;
+
+                const motion = (vm as any).modal?.motion;
+                const isCutting =
+                    motion === 'G1' || motion === 'G2' || motion === 'G3';
+                const isMotion = isCutting || motion === 'G0';
+                const unitScale = (vm as any).modal?.units === 'G20' ? 25.4 : 1;
+
+                if (isMotion && blockHasGeom && blockL > 0) {
+                    const dx = blockEndX - blockStartX;
+                    const dy = blockEndY - blockStartY;
+                    const dz = blockEndZ - blockStartZ;
+                    const chordLen = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                    const ux = chordLen > 1e-9 ? dx / chordLen : 0;
+                    const uy = chordLen > 1e-9 ? dy / chordLen : 0;
+                    const uz = chordLen > 1e-9 ? dz / chordLen : 0;
+                    const moveLenMm = blockL * unitScale;
+                    const cmdMm = resolveCommandedFmm(
+                        Number((vm as any).feed) || 0,
+                        unitScale,
+                        moveLenMm,
+                    );
+                    pushChordBlock(
+                        ux, uy, uz,
+                        moveLenMm,
+                        cmdMm,
+                        isCutting,
+                        unitScale,
+                        vertexStart,
+                        vertexEnd,
+                    );
+                } else {
+                    plannerBlocks.push({
+                        L: 0, ux: 0, uy: 0, uz: 0,
+                        accel: 0, vnominal: 0, commandedFmm: 0,
+                        unitScale: 1,
+                        isCutting: false, hasMotion: false,
+                        vertexStart, vertexEnd,
+                    });
+                }
+            }
+            blockHasGeom = false;
+            blockL = 0;
+        }
+
         onData();
     });
 
@@ -1063,6 +1422,227 @@ self.onmessage = function ({ data }: { data: WorkerData }) {
 
     markProfile(profiler, 'after_parse_loop');
     sampleHeap(profiler, 'after_parse_loop');
+
+    // GRBL-style planner lookahead. Same algorithm as grbl/planner.c: derive
+    // junction speeds from inter-block angles, propagate decel constraints
+    // backward then accel constraints forward, then evaluate the trapezoid
+    // velocity profile at each vertex. The first/last block start and end at
+    // rest. Non-motion frames (comments, M-only lines) are kept in the queue
+    // to align with frames[] but contribute nothing to the planning —
+    // direction is preserved across them so a comment between two collinear
+    // G1s doesn't introduce a phantom corner.
+    const verticesUsed = vertices.length / 3;
+    const vertexRatios = new Float32Array(verticesUsed);
+    vertexRatios.fill(-1);
+
+    if (needsVisualization && plannerBlocks.length > 0 && verticesUsed > 0) {
+        const N = plannerBlocks.length;
+        const vJunc = new Float64Array(N + 1); // max speed entering block i
+        const vEntry = new Float64Array(N);
+        const vExit = new Float64Array(N);
+
+        // 1) Junction speeds
+        let prevUx = 0, prevUy = 0, prevUz = 0;
+        let prevAccel = 0;
+        let havePrev = false;
+        for (let i = 0; i < N; i++) {
+            const blk = plannerBlocks[i];
+            if (!blk.hasMotion) continue;
+            if (!havePrev) {
+                vJunc[i] = 0;
+            } else {
+                const cosTheta = -(prevUx * blk.ux + prevUy * blk.uy + prevUz * blk.uz);
+                let vj;
+                if (cosTheta >= 0.999) {
+                    vj = blk.vnominal; // colinear
+                } else if (cosTheta <= -0.999) {
+                    vj = 0; // reversal
+                } else {
+                    const sinHalf = Math.sqrt(0.5 * (1 - cosTheta));
+                    const aJ = junctionAccel(prevAccel, blk.accel);
+                    vj = Math.sqrt(
+                        (aJ * JUNCTION_DEVIATION * sinHalf) / (1 - sinHalf),
+                    );
+                }
+                vJunc[i] = Math.min(vj, blk.vnominal);
+            }
+            prevUx = blk.ux; prevUy = blk.uy; prevUz = blk.uz;
+            prevAccel = blk.accel;
+            havePrev = true;
+        }
+        vJunc[0] = 0;
+        vJunc[N] = 0;
+
+        // 2) Backward pass — propagate decel constraints through the chain.
+        // GRBL-style: each block's max entry is the speed we can reach if we
+        // decelerate to the NEXT BLOCK'S ENTRY (not just the next junction)
+        // within L. Using the next entry means a chain of short blocks
+        // approaching a hard corner pulls every block in the chain down,
+        // matching what the real planner does.
+        let nextEntry = 0; // exit of the last block is 0 (end at rest)
+        for (let i = N - 1; i >= 0; i--) {
+            const blk = plannerBlocks[i];
+            if (!blk.hasMotion || blk.L <= 0) {
+                vEntry[i] = 0;
+                continue; // non-motion blocks don't update nextEntry
+            }
+            // The corner velocity between block i and i+1 is the lesser of
+            // the junction cap and the next block's already-computed entry.
+            const exitCap = Math.min(vJunc[i + 1], nextEntry);
+            const maxEntry = Math.sqrt(
+                exitCap * exitCap + 2 * blk.accel * blk.L,
+            );
+            vEntry[i] = Math.min(blk.vnominal, vJunc[i], maxEntry);
+            nextEntry = vEntry[i];
+        }
+
+        // 2b) Windowed release — real GRBL has a ~32-block planner buffer, so
+        // decel constraints from blocks more than ~32 ahead don't actually
+        // reach earlier moves at runtime. For each block, recompute its
+        // entry speed assuming the planner can only see LOOKAHEAD_WINDOW
+        // blocks ahead, and raise the global value back to the local one if
+        // the global pass was over-constrained by a far-future corner.
+        //
+        // Skips when N ≤ window (global == windowed in that case) and skips
+        // when global vEntry[i] already equals vnominal (nothing to release).
+        const LOOKAHEAD_WINDOW = 32;
+        if (N > LOOKAHEAD_WINDOW) {
+            for (let i = 0; i < N; i++) {
+                const blk = plannerBlocks[i];
+                if (!blk.hasMotion || blk.L <= 0) continue;
+                if (vEntry[i] >= blk.vnominal - 1e-6) continue;
+
+                const windowEnd = Math.min(i + LOOKAHEAD_WINDOW, N);
+                // Beyond the window the planner has no visibility, so the
+                // last block in the window exits unconstrained (vnominal).
+                // If the window reaches the end of the file, exit is 0.
+                let localNext =
+                    windowEnd >= N
+                        ? 0
+                        : plannerBlocks[windowEnd - 1].vnominal;
+                let windowedEntry = blk.vnominal;
+                for (let j = windowEnd - 1; j >= i; j--) {
+                    const b = plannerBlocks[j];
+                    if (!b.hasMotion || b.L <= 0) continue;
+                    const exitCap =
+                        j + 1 >= windowEnd
+                            ? localNext
+                            : Math.min(vJunc[j + 1], localNext);
+                    const maxEntry = Math.sqrt(
+                        exitCap * exitCap + 2 * b.accel * b.L,
+                    );
+                    localNext = Math.min(b.vnominal, vJunc[j], maxEntry);
+                    if (j === i) windowedEntry = localNext;
+                }
+                if (windowedEntry > vEntry[i]) {
+                    vEntry[i] = windowedEntry;
+                }
+            }
+        }
+
+        // 3) Forward pass — cap each entry by what we can accelerate to from
+        // the previous block's entry. Tracks the last motion block so
+        // non-motion lines between two motion blocks don't break the chain.
+        let prevMotionIdx = -1;
+        for (let i = 0; i < N; i++) {
+            const blk = plannerBlocks[i];
+            if (!blk.hasMotion || blk.L <= 0) continue;
+            if (prevMotionIdx >= 0) {
+                const prev = plannerBlocks[prevMotionIdx];
+                const maxFromPrev = Math.sqrt(
+                    vEntry[prevMotionIdx] * vEntry[prevMotionIdx] +
+                        2 * prev.accel * prev.L,
+                );
+                vEntry[i] = Math.min(vEntry[i], maxFromPrev);
+            }
+            prevMotionIdx = i;
+        }
+
+        // 4) Derive exits — each block's exit is the next motion block's
+        // entry (shared corner velocity), with 0 at the end of the file.
+        let nextMotionEntry = 0;
+        for (let i = N - 1; i >= 0; i--) {
+            const blk = plannerBlocks[i];
+            if (!blk.hasMotion || blk.L <= 0) {
+                vExit[i] = 0;
+                continue;
+            }
+            vExit[i] = nextMotionEntry;
+            nextMotionEntry = vEntry[i];
+        }
+
+        // 5) Per-vertex velocity profile. Walk each block's geometry,
+        //    accumulate distance from the block's first vertex, and evaluate
+        //    the trapezoid (or triangle) speed at that distance. Convert to
+        //    ratio = (speed × 60) / commandedF. THREE.Line interpolates
+        //    between adjacent vertices, giving smooth color gradients.
+        const verticesData = vertices.data;
+        for (let i = 0; i < N; i++) {
+            const blk = plannerBlocks[i];
+            if (
+                !blk.hasMotion ||
+                blk.L <= 0 ||
+                !blk.isCutting ||
+                blk.commandedFmm <= 0
+            ) {
+                continue;
+            }
+            const ve = vEntry[i], vx = vExit[i], vn = blk.vnominal;
+            const a = blk.accel, L = blk.L;
+            const dAccelFull = (vn * vn - ve * ve) / (2 * a);
+            const dDecelFull = (vn * vn - vx * vx) / (2 * a);
+
+            // Trapezoid or triangle: where in the move does the speed change.
+            let dAccelEnd: number, dDecelStart: number, vPeak: number;
+            if (dAccelFull + dDecelFull <= L) {
+                dAccelEnd = dAccelFull;
+                dDecelStart = L - dDecelFull;
+                vPeak = vn;
+            } else {
+                vPeak = Math.sqrt(
+                    Math.max(a * L + 0.5 * (ve * ve + vx * vx), 0),
+                );
+                dAccelEnd = (vPeak * vPeak - ve * ve) / (2 * a);
+                dDecelStart = dAccelEnd; // no cruise
+            }
+
+            const speedAt = (d: number): number => {
+                if (d <= dAccelEnd) {
+                    return Math.sqrt(ve * ve + 2 * a * d);
+                }
+                if (d >= dDecelStart) {
+                    const remaining = Math.max(L - d, 0);
+                    return Math.sqrt(vx * vx + 2 * a * remaining);
+                }
+                return vPeak;
+            };
+
+            const vStart = blk.vertexStart;
+            const vEnd = Math.min(blk.vertexEnd, verticesUsed);
+            if (vStart >= vEnd) continue;
+
+            const scale = blk.unitScale; // file-units → mm for distance accum
+            const denom = blk.commandedFmm;
+
+            // First vertex sits at d=0 → uses vEntry directly.
+            vertexRatios[vStart] = (ve * 60) / denom;
+            let prevX = verticesData[vStart * 3];
+            let prevY = verticesData[vStart * 3 + 1];
+            let prevZ = verticesData[vStart * 3 + 2];
+            let cumDistMm = 0;
+
+            for (let v = vStart + 1; v < vEnd; v++) {
+                const x = verticesData[v * 3];
+                const y = verticesData[v * 3 + 1];
+                const z = verticesData[v * 3 + 2];
+                const dx = x - prevX, dy = y - prevY, dz = z - prevZ;
+                cumDistMm += Math.sqrt(dx * dx + dy * dy + dz * dz) * scale;
+                const d = cumDistMm > L ? L : cumDistMm; // clamp drift
+                vertexRatios[v] = (speedAt(d) * 60) / denom;
+                prevX = x; prevY = y; prevZ = z;
+            }
+        }
+    }
 
     const { estimates } = vm.getData();
     fileInfo = vm.generateFileStats();
@@ -1150,6 +1730,9 @@ self.onmessage = function ({ data }: { data: WorkerData }) {
     const compactFrames = toCompactUint32Array(tFrames);
     const compactColorArray = toCompactFloat32Array(colorArray);
     const compactSavedColorsArray = toCompactFloat32Array(savedColorsArray);
+    const compactVertexRatios = needsVisualization
+        ? toCompactFloat32Array(vertexRatios)
+        : new Float32Array(0);
 
     if (profiler) {
         profiler.counts.virtualized_lines = virtualizedLines;
@@ -1203,6 +1786,8 @@ self.onmessage = function ({ data }: { data: WorkerData }) {
         isLaser?: boolean;
         isSecondary?: boolean;
         activeVisualizer?: VISUALIZER_TYPES_T;
+        vertexRatiosBuffer?: ArrayBuffer;
+        vertexRatioLen?: number;
     } = {
         type: 'geometryReady',
         jobId,
@@ -1232,6 +1817,11 @@ self.onmessage = function ({ data }: { data: WorkerData }) {
         geometryMessage.isLaser = isLaser;
     }
 
+    if (needsVisualization) {
+        geometryMessage.vertexRatiosBuffer = compactVertexRatios.buffer;
+        geometryMessage.vertexRatioLen = compactVertexRatios.length;
+    }
+
     const transferList: ArrayBuffer[] = [
         compactVertices.buffer,
         compactFrames.buffer,
@@ -1240,6 +1830,9 @@ self.onmessage = function ({ data }: { data: WorkerData }) {
     ];
     if (isLaser) {
         transferList.push(compactSpindleFrameSpeeds.buffer);
+    }
+    if (needsVisualization && compactVertexRatios.byteLength > 0) {
+        transferList.push(compactVertexRatios.buffer);
     }
 
     markProfile(profiler, 'before_post_message');

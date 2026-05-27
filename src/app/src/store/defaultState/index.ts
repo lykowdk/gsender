@@ -438,6 +438,7 @@ const defaultState: State = {
             showLineWarnings: false,
             showSoftLimitWarning: false,
             hideProcessedLines: false,
+            feedrateHeatmap: false,
             debug: {
                 profileWorker: false,
                 profileSampleEvery: 10000,

@@ -34,6 +34,70 @@ const STATES = {
     DONE: 2,
 };
 
+// Anything at or below this ratio (achieved / commanded F) is full red.
+// FeedrateLegend.tsx mirrors this value so the legend matches the toolpath.
+const HEATMAP_RATIO_FLOOR = 0.25;
+
+// When the heat map is on, the in-buffer / active-line band needs a color
+// that's distinguishable from the green→yellow→red ramp underneath it.
+// Yellow (the default PLANNED_PART) gets lost against the heat-map gradient.
+// FeedrateLegend.tsx mirrors this color for the active-position pointer.
+const HEATMAP_ACTIVE_COLOR = '#ff1493'; // deep pink
+
+// Four-stop piecewise ramp on the per-vertex achieved/commanded ratio,
+// keyed at clean percentage points so the legend labels round nicely:
+//   ratio ≤ 0.25 → red       (1.00, 0.00, 0)
+//   ratio   0.50 → orange    (1.00, 0.50, 0)
+//   ratio   0.75 → yellow    (1.00, 1.00, 0)
+//   ratio   1.00 → green     (0.00, 1.00, 0)
+// FeedrateLegend.tsx mirrors the same stops so the gradient and the rendered
+// toolpath stay aligned. Compared to a 3-stop red-yellow-green ramp this
+// puts orange between red and yellow (so 40-50% of commanded reads as
+// distinctly different from 25%) and widens the yellow band on the high
+// side, making typical mid-cruise moves look unambiguously yellow rather
+// than yellow-green.
+const heatmapRGB = (ratio) => {
+    const clamped = Math.max(HEATMAP_RATIO_FLOOR, Math.min(1, ratio));
+    const u = (clamped - HEATMAP_RATIO_FLOOR) / (1 - HEATMAP_RATIO_FLOOR);
+    if (u < 1 / 3) {
+        // red → orange
+        return [1, 0.5 * (3 * u), 0];
+    }
+    if (u < 2 / 3) {
+        // orange → yellow
+        return [1, 0.5 + 0.5 * (3 * (u - 1 / 3)), 0];
+    }
+    // yellow → green
+    return [1 - 3 * (u - 2 / 3), 1, 0];
+};
+
+// Build a new RGBA color buffer keyed on per-vertex achieved/requested ratios.
+// Vertices with ratio<0 (G0 rapids, lines without F, M-only lines) keep their
+// motion color. THREE.Line then interpolates colors linearly between adjacent
+// vertices, which gives smooth gradients along each move's velocity profile.
+const buildHeatmapColors = (baseColors, vertexRatios) => {
+    if (!baseColors || baseColors.length === 0) {
+        return baseColors;
+    }
+    const out = new Float32Array(baseColors);
+    if (!vertexRatios || vertexRatios.length === 0) {
+        return out;
+    }
+    const totalVertices = out.length / 4;
+    const n = Math.min(totalVertices, vertexRatios.length);
+    for (let v = 0; v < n; v++) {
+        const ratio = vertexRatios[v];
+        if (ratio < 0) continue;
+        const [r, g, b] = heatmapRGB(ratio);
+        const off = v * 4;
+        out[off] = r;
+        out[off + 1] = g;
+        out[off + 2] = b;
+        // alpha preserved from baseColors copy
+    }
+    return out;
+};
+
 class GCodeVisualizer {
     constructor(theme) {
         this.group = new THREE.Object3D();
@@ -58,10 +122,59 @@ class GCodeVisualizer {
         // Hide processed lines
         this.hideProcessedLines = false;
 
+        // Feedrate heat map state. baseMotionColors is an immutable snapshot
+        // of the per-motion-type palette (G0/G1/G2/G3 colors) from the worker.
+        // vertexRatios is one achieved/commanded ratio per vertex; -1 = skip.
+        // heatmapEnabled toggles in-buffer color (yellow normally, hot pink
+        // when on so it stays visible against the gradient).
+        this.baseMotionColors = null;
+        this.vertexRatios = null;
+        this.heatmapEnabled = false;
+
         return this;
     }
 
-    render({ vertices, frames, isLaser = false }, colorArray, savedColors) {
+    // Resolve the in-buffer / active-line color. Hot pink when the heat map
+    // is on, so it doesn't blend into the green/yellow/red ramp; the theme's
+    // PLANNED_PART (yellow by default) otherwise.
+    _plannedColor() {
+        return new THREE.Color(
+            this.heatmapEnabled
+                ? HEATMAP_ACTIVE_COLOR
+                : this.theme.get(PLANNED_PART),
+        );
+    }
+
+    // Average ratio across the vertices that belong to a given gcode line.
+    // Returns -1 if the line has no cutting motion or no ratio data.
+    getActiveRatioForLine(lineIndex) {
+        if (
+            !this.vertexRatios ||
+            !this.frames ||
+            lineIndex < 0 ||
+            lineIndex >= this.frames.length
+        ) {
+            return -1;
+        }
+        const vStart = lineIndex === 0 ? 0 : this.frames[lineIndex - 1];
+        const vEnd = Math.min(this.frames[lineIndex], this.vertexRatios.length);
+        let sum = 0;
+        let count = 0;
+        for (let v = vStart; v < vEnd; v++) {
+            const r = this.vertexRatios[v];
+            if (r >= 0) {
+                sum += r;
+                count++;
+            }
+        }
+        return count > 0 ? sum / count : -1;
+    }
+
+    render(
+        { vertices, frames, isLaser = false, vertexRatios = null },
+        colorArray,
+        savedColors,
+    ) {
         this.vertices = new THREE.BufferAttribute(vertices, 3);
         this.frames = frames;
         this.isLaser = isLaser;
@@ -71,6 +184,12 @@ class GCodeVisualizer {
                 ? savedColors
                 : colorArray;
         this.colors = baseColors;
+        // Keep an immutable snapshot of the motion palette. The BufferAttribute
+        // shares storage with baseColors — if we kept the same reference here,
+        // overwriting colorAttr.array during heatmap-on would silently mutate
+        // baseMotionColors, breaking the heatmap-off restore.
+        this.baseMotionColors = new Float32Array(baseColors);
+        this.vertexRatios = vertexRatios;
         this.originalColors = null;
         const defaultColor = new THREE.Color(this.theme.get(CUTTING_PART));
         // --rotary
@@ -119,8 +238,8 @@ class GCodeVisualizer {
         if (this.frames.length === 0) {
             return;
         }
-        const plannedColor = new THREE.Color(this.theme.get(PLANNED_PART));
-        const defaultColorArray = [...plannedColor.toArray(), 1]; // yellow
+        const plannedColor = this._plannedColor();
+        const defaultColorArray = [...plannedColor.toArray(), 1];
 
         frameIndex = Math.min(frameIndex, this.frames.length - 1);
         frameIndex = Math.max(frameIndex, 0);
@@ -289,8 +408,8 @@ class GCodeVisualizer {
             // grey
             const runColor = new THREE.Color(SECONDARY_COLOR);
             const greyArray = [...runColor.toArray(), opacity];
-            // yellow
-            const yellowColor = new THREE.Color(this.theme.get(PLANNED_PART));
+            // in-buffer / active band (yellow normally, hot pink in heat map)
+            const yellowColor = this._plannedColor();
             const yellowArray = [...yellowColor.toArray(), 1];
             // color arrays
             const runColorArray = Array.from(
@@ -340,11 +459,8 @@ class GCodeVisualizer {
             } else if (this.plannedState === STATES.START) {
                 // this.frameIndex starts at 0, so the yellow line we just made includes every line before the current starting line.
                 // redo yellow with the starting index being the end of the grey
-                const plannedColor = new THREE.Color(
-                    this.theme.get(PLANNED_PART),
-                );
-
-                const defaultColorArray = [...plannedColor.toArray(), 1]; // yellow
+                const plannedColor = this._plannedColor();
+                const defaultColorArray = [...plannedColor.toArray(), 1];
 
                 const colorArray = Array.from(
                     { length: this.frameIndex - v2FrameIndex + 1 },
@@ -402,6 +518,33 @@ class GCodeVisualizer {
     }
 
     /**
+     * Switch the geometry's color buffer between the per-motion-type palette
+     * and a green→red ramp keyed by the per-move achieved/commanded ratio.
+     * Safe to call before `render()` (no-op) and any time after.
+     * @param {boolean} enabled
+     */
+    setHeatmapMode(enabled) {
+        this.heatmapEnabled = !!enabled;
+        const workpiece = this.group.children[0];
+        const colorAttr = workpiece?.geometry?.getAttribute('color');
+        if (!colorAttr || !this.baseMotionColors) {
+            return;
+        }
+        const hasRatios = this.vertexRatios && this.vertexRatios.length > 0;
+        const nextColors = enabled && hasRatios
+            ? buildHeatmapColors(this.baseMotionColors, this.vertexRatios)
+            : new Float32Array(this.baseMotionColors);
+
+        colorAttr.array.set(nextColors);
+        colorAttr.needsUpdate = true;
+        // Keep `colors` and `originalColors` in sync with what's on screen so
+        // playback restoration (greyOutLines, setFrameIndex) brings back the
+        // currently displayed palette, not the motion palette.
+        this.colors = nextColors;
+        this.originalColors = new Float32Array(nextColors);
+    }
+
+    /**
      * Toggle hiding of processed lines
      * @param {boolean} hide - Whether to hide processed lines
      */
@@ -441,6 +584,9 @@ class GCodeVisualizer {
         this.plannedColorArray = [];
         this.plannedV1 = null;
         this.plannedState = STATES.START;
+        this.baseMotionColors = null;
+        this.vertexRatios = null;
+        this.heatmapEnabled = false;
         // --rotary
         this.frameDifferences = Array(16).fill(null);
         this.oldV1s = Array(16).fill(null);

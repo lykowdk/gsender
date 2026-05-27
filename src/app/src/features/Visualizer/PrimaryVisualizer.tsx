@@ -15,6 +15,7 @@ import { FaFeatherAlt } from 'react-icons/fa';
 import cx from 'classnames';
 import { Tooltip } from 'app/components/Tooltip';
 import GcodeEditor from './GcodeEditor';
+import FeedrateLegend from './FeedrateLegend';
 import { Actions, State } from './definitions';
 
 interface Props {
@@ -139,6 +140,7 @@ const PrimaryVisualizer = ({
                         cameraPosition={cameraPosition}
                     />
                     <WorkspaceSelector />
+                    <FeedrateLegend />
 
                     {timeline}
 
